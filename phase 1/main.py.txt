@@ -1,0 +1,340 @@
+import concurrent.futures
+import subprocess
+import json
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+import pdfkit
+import pandas as pd
+import requests
+import socket
+import os
+import time
+from datetime import datetime
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
+from tqdm import tqdm
+from bs4 import BeautifulSoup
+from requests.exceptions import RequestException
+
+
+# Define domain and email details
+domain_to_monitor = "zoom.us"  # The domain to monitor
+email_from = "dnstwistalerts@gmail.com"
+email_to = "twistdns@gmail.com"
+smtp_server = "smtp.gmail.com"
+smtp_port = 587
+smtp_username = "dnstwistalerts@gmail.com"
+smtp_password = "sxai tvgu skym bghv"  # Use your app-specific password
+
+# Set up Chrome options
+chrome_options = Options()
+chrome_options.add_argument("--headless")
+chrome_options.add_argument("--no-sandbox")
+chrome_options.add_argument("--disable-dev-shm-usage")
+chrome_options.add_argument("--disable-gpu")
+
+# Set up WebDriver
+driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+
+def send_email(subject, body, pdf_file=None):
+    try:
+        print("Setting up SMTP connection...")
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(smtp_username, smtp_password)
+        print("Logged into SMTP server...")
+
+        msg = MIMEMultipart()
+        msg['From'] = email_from
+        msg['To'] = email_to
+        msg['Subject'] = subject
+
+        # Attach the email body
+        msg.attach(MIMEText(body, 'plain'))
+
+        # Attach the PDF file, if it exists
+        if pdf_file:
+            try:
+                with open(pdf_file, 'rb') as attachment:
+                    part = MIMEBase('application', 'octet-stream')
+                    part.set_payload(attachment.read())
+                    encoders.encode_base64(part)
+                    part.add_header('Content-Disposition', f'attachment; filename="{os.path.basename(pdf_file)}"')
+                    msg.attach(part)
+                print("Attached PDF file to the email.")
+            except Exception as e:
+                print(f"Error attaching PDF: {e}")
+
+        # Send the email
+        server.sendmail(email_from, email_to, msg.as_string())
+        print("Email sent successfully!")
+
+        # Quit the server
+        server.quit()
+
+    except smtplib.SMTPAuthenticationError as e:
+        print(f"Authentication failed: {e}")
+    except smtplib.SMTPException as e:
+        print(f"SMTP error occurred: {e}")
+    except Exception as e:
+        print(f"Error sending email: {e}")
+
+def domain_exists(domain):
+    try:
+        socket.gethostbyname(domain)
+        return True
+    except socket.gaierror:
+        return False
+
+def get_whois_info(domain):
+    if not domain_exists(domain):
+        return {
+            'created_date': 'Domain does not exist or is not registered',
+            'updated_date': '',
+            'dns_ns': 'Unknown',
+            'registrant_country': 'Unknown',
+            'registrant_province': 'Unknown',
+            'registrar_name': 'Unknown',
+            'registrar_email': 'Unknown',
+            'registrar_phone': 'Unknown'
+        }
+
+    try:
+        api_url = f"https://who-dat.as93.net/{domain}"
+        response = requests.get(api_url)
+        whois_data = response.json()
+
+        domain_info = whois_data.get('domain', {})
+        created_date = domain_info.get('created_date', 'Unknown')
+        updated_date = domain_info.get('updated_date', 'Unknown')
+        dns_ns = domain_info.get('name_servers', [])
+
+        registrant_info = whois_data.get('registrant', {})
+        registrant_country = registrant_info.get('country', 'Unknown')
+        registrant_province = registrant_info.get('province', 'Unknown')
+
+        registrar_info = whois_data.get('registrar', {})
+        registrar_name = registrar_info.get('name', 'Unknown')
+        registrar_email = registrar_info.get('email', 'Unknown')
+        registrar_phone = registrar_info.get('phone', 'Unknown')
+
+        return {
+            'created_date': created_date,
+            'updated_date': updated_date,
+            'dns_ns': dns_ns,
+            'registrant_country': registrant_country,
+            'registrant_province': registrant_province,
+            'registrar_name': registrar_name,
+            'registrar_email': registrar_email,
+            'registrar_phone': registrar_phone
+        }
+    except Exception as e:
+        return {
+            'created_date': f'Error fetching WHOIS data: {e}',
+            'updated_date': '',
+            'dns_ns': 'Unknown',
+            'registrant_country': 'Unknown',
+            'registrant_province': 'Unknown',
+            'registrar_name': 'Unknown',
+            'registrar_email': 'Unknown',
+            'registrar_phone': 'Unknown'
+        }
+
+def fetch_whois_data(domain_list):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        return list(tqdm(executor.map(get_whois_info, domain_list), total=len(domain_list), desc="Fetching WHOIS Data"))
+
+def run_dnstwist(domain):
+    try:
+        print(f"Running dnstwist for domain: {domain}")
+        result = subprocess.run(
+            ['dnstwist', '--registered', '--format', 'json', domain],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        print("dnstwist completed.")
+        json_output = json.loads(result.stdout)
+        return json_output
+    except subprocess.CalledProcessError as e:
+        print(f"Error running dnstwist: {e}")
+        return []
+
+def fetch_certificates(domain):
+    """
+    Fetch and parse the first certificate information for a given domain from crt.sh.
+    
+    Args:
+        domain (str): The domain to search for certificates on crt.sh.
+        
+    Returns:
+        dict: A dictionary containing the first certificate's data.
+    """
+    url = f'https://crt.sh/?q={domain}'
+    
+    try:
+        response = requests.get(url)
+        response.raise_for_status()  # Check for HTTP errors
+    except RequestException as e:
+        print(f"Error fetching data from crt.sh: {e}")
+        return None
+    
+    soup = BeautifulSoup(response.content, 'html.parser')
+    
+    # Ensure the expected table exists
+    tables = soup.find_all('table')
+    if len(tables) < 3:
+        print("Error: Unable to find the expected certificate table.")
+        return None
+    
+    cert_table = tables[2]  # The third table is where the certificate data is
+
+    # Parse the first row in the certificate table
+    rows = cert_table.find_all('tr')[1:]  # Skip the header row
+
+    if rows:
+        cols = rows[0].find_all('td')
+        if len(cols) >= 7:
+            # Extract the issuer link
+            issuer_anchor = cols[6].find('a')
+            issuer_link = issuer_anchor['href'].strip() if issuer_anchor else ''
+            
+            return {
+                'crt.sh ID': cols[0].text.strip(),
+                'Logged At': cols[1].text.strip(),
+                'Not Before': cols[2].text.strip(),
+                'Not After': cols[3].text.strip(),
+                'Common Name': cols[4].text.strip(),
+                'Matching Identities': cols[5].text.strip(),
+                'Issuer Name': cols[6].text.strip(),
+                'Certificate Link': f'https://crt.sh/?id={cols[0].text.strip()}',
+                'Issuer Link': f'https://crt.sh/{issuer_link}',
+            }
+    return None
+
+def format_table(data, certificates):
+    # Generate HTML table
+    table = f"""
+    <html>
+    <head>
+    <style>
+        table {{
+            width: 100%;
+            table-layout: fixed;
+            word-wrap: break-word;
+            border-collapse: collapse;
+        }}
+        th, td {{
+            padding: 10px;
+            border: 1px solid black;
+            text-align: left;
+        }}
+    </style>
+    </head>
+    <body>
+    <h2>Phishing domain alert for {domain_to_monitor}</h2>
+    <table>
+    <tr>
+        <th>Domain</th>
+        <th>Fuzzer</th>
+        <th>DNS A (IPv4)</th>
+        <th>DNS AAAA (IPv6)</th>
+        <th>DNS NS (Name Server)</th>
+        <th>Created Date</th>
+        <th>Updated Date</th>
+        <th>Registrant Country</th>
+        <th>Registrant Province</th>
+        <th>Registrar Name</th>
+        <th>Registrar Email</th>
+        <th>Registrar Phone</th>
+        <th>crt.sh ID</th>
+        <th>Logged At</th>
+        <th>Not Before</th>
+        <th>Not After</th>
+        <th>Common Name</th>
+        <th>Matching Identities</th>
+        <th>Issuer Name</th>
+    </tr>
+    """
+
+    # Populate the table with data
+    for entry in data:
+        cert = certificates.get(entry['domain'], None)
+        if cert:
+            table += f"""
+            <tr>
+                <td>{entry.get('domain', '')}</td>
+                <td>{entry.get('fuzzer', '')}</td>
+                <td>{', '.join(entry.get('dns_a', []))}</td>
+                <td>{', '.join(entry.get('dns_aaaa', []))}</td>
+                <td>{', '.join(entry.get('dns_ns', []))}</td>
+                <td>{entry.get('created_date', '')}</td>
+                <td>{entry.get('updated_date', '')}</td>
+                <td>{entry.get('registrant_country', '')}</td>
+                <td>{entry.get('registrant_province', '')}</td>
+                <td>{entry.get('registrar_name', '')}</td>
+                <td>{entry.get('registrar_email', '')}</td>
+                <td>{entry.get('registrar_phone', '')}</td>
+                <td><a href="{cert.get('Certificate Link', '#')}">{cert.get('crt.sh ID', '')}</a></td>
+                <td>{cert.get('Logged At', '')}</td>
+                <td>{cert.get('Not Before', '')}</td>
+                <td>{cert.get('Not After', '')}</td>
+                <td>{cert.get('Common Name', '')}</td>
+                <td>{cert.get('Matching Identities', '')}</td>
+                <td><a href="{cert.get('Issuer Link', '#')}">{cert.get('Issuer Name', '')}</a></td>
+            </tr>
+            """
+    table += "</table></body></html>"
+    return table
+
+def check_phishing_domains():
+    try:
+        # Run dnstwist for domain generation
+        json_output = run_dnstwist(domain_to_monitor)
+
+        if not json_output:
+            print("No data returned from dnstwist.")
+            return
+
+        domain_list = [entry['domain'] for entry in json_output]
+        print(f"Fetching WHOIS data for {len(domain_list)} domains...")
+        whois_data = fetch_whois_data(domain_list)
+
+        # Fetch the first certificate for each domain
+        print("Fetching certificate data from crt.sh...")
+        certificates = {domain: fetch_certificates(domain) for domain in domain_list}
+
+        entries = []
+        for entry, whois_info in zip(json_output, whois_data):
+            entry.update(whois_info)
+            entries.append(entry)
+
+        if entries:
+            print("Generating PDF report...")
+            table_content = format_table(entries, certificates)
+            pdf_file = f'{domain_to_monitor}_phishing_domains.pdf'
+            pdf_options = {
+                'page-size': 'A3',  # Set PDF page size to A3
+                'orientation': 'Landscape',  # Set landscape mode
+                'encoding': "UTF-8",
+                'enable-local-file-access': None
+            }
+            pdfkit.from_string(table_content, pdf_file, options=pdf_options)
+            print(f"PDF saved as {pdf_file}")
+
+            # Send the report via email
+            send_email(f"Phishing Domain Alert for {domain_to_monitor}", "Please find the attached PDF report.", pdf_file)
+        else:
+            print("No phishing domains found.")
+    except Exception as e:
+        print(f"Error in phishing domain check: {e}")
+
+if __name__ == "__main__":
+    check_phishing_domains()
+    driver.quit()

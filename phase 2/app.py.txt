@@ -1,0 +1,92 @@
+from flask import Flask, render_template, request, jsonify
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.base import SchedulerAlreadyRunningError
+from utils.main import check_phishing_domains  # Import the phishing check function
+import pandas as pd
+import os
+import datetime
+from uuid import uuid4
+import logging
+
+# Configure logging
+logging.basicConfig()
+logging.getLogger('apscheduler').setLevel(logging.DEBUG)
+
+app = Flask(__name__)
+scheduler = BackgroundScheduler()
+
+# Store user entries and job IDs
+user_jobs = {}
+log_file = 'user_log.xlsx'
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    if request.method == 'POST':
+        # Get user input from the form
+        website = request.form['website']
+        email = request.form['email']
+
+        # Generate a unique job ID
+        job_id = str(uuid4())
+
+        # Run the phishing domain check immediately
+        try:
+            check_phishing_domains(website, email)
+        except Exception as e:
+            return jsonify({"error": f"Failed to run phishing check: {str(e)}"}), 500
+
+        # Log the initial email sending
+        log_entry(job_id, website, email, "Email sent immediately")
+
+        # Schedule the job to run every 30 minutes
+        try:
+            scheduler.add_job(func=send_scheduled_report, trigger='interval', minutes=30, id=job_id, args=[job_id, website, email])
+        except Exception as e:
+            return jsonify({"error": f"Failed to schedule report: {str(e)}"}), 500
+
+        # Save the job details
+        user_jobs[job_id] = {'website': website, 'email': email}
+
+        return jsonify({"message": "Phishing check completed, email sent, and scheduled every 30 minutes!"})
+
+    return render_template('index.html')
+
+def send_scheduled_report(job_id, website, email):
+    print(f"Sending scheduled report for job {job_id}...")
+    try:
+        check_phishing_domains(website, email)
+        log_entry(job_id, website, email, "Scheduled email sent")
+    except Exception as e:
+        print(f"Error sending scheduled report for job {job_id}: {str(e)}")
+
+def log_entry(job_id, website, email, status):
+    # Create the log entry
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    entry = {'Job ID': job_id, 'Website': website, 'Email': email, 'Status': status, 'Timestamp': timestamp}
+
+    # Load or create the log file
+    if not os.path.exists(log_file):
+        df = pd.DataFrame(columns=['Job ID', 'Website', 'Email', 'Status', 'Timestamp'])
+    else:
+        df = pd.read_excel(log_file)
+
+    # Convert the new entry into a DataFrame
+    new_entry_df = pd.DataFrame([entry])
+
+    # Concatenate the new entry with the existing DataFrame
+    df = pd.concat([df, new_entry_df], ignore_index=True)
+
+    # Save the updated DataFrame back to the Excel file
+    df.to_excel(log_file, index=False)
+
+if __name__ == '__main__':
+    try:
+        preload_routes(app)
+        if not scheduler.running:
+            scheduler.start()
+    except SchedulerAlreadyRunningError:
+        print("Scheduler is already running.")
+    except Exception as e:
+        print(f"Failed to start scheduler: {str(e)}")
+
+    app.run(debug=False, host='0.0.0.0')  # Bind to all interfaces
